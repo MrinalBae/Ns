@@ -1,5 +1,7 @@
-from pathlib import Path
+# app/temp_storage.py
+
 from datetime import datetime, timezone
+from pathlib import Path
 import os
 import secrets
 import tempfile
@@ -7,6 +9,9 @@ import tempfile
 
 BASE = Path(tempfile.gettempdir()) / "image_ai_bot"
 BASE.mkdir(parents=True, exist_ok=True)
+
+ALLOWED_EXTENSIONS = {".jpg", ".png"}
+ALLOWED_CONTENT_TYPES = {"image/jpeg", "image/png"}
 
 
 def _valid_file_id(file_id: str) -> bool:
@@ -19,7 +24,7 @@ def _valid_file_id(file_id: str) -> bool:
     return True
 
 
-def cleanup_expired():
+def cleanup_expired() -> None:
     now = datetime.now(timezone.utc).timestamp()
 
     try:
@@ -32,33 +37,22 @@ def cleanup_expired():
             if not path.is_file():
                 continue
 
-            expires_at = path.stat().st_mtime
-
-            if now >= expires_at:
+            if now >= path.stat().st_mtime:
                 path.unlink(missing_ok=True)
 
         except OSError:
             pass
 
 
-def new_file_id(extension: str | None = None) -> str:
-    """
-    Generate a safe temporary file ID.
+def new_file_id(extension: str = ".jpg") -> str:
+    extension = extension.lower()
 
-    By default no extension is added.
-    Callers should explicitly provide .jpg or .png
-    based on the actual image content.
-    """
-
-    if extension is not None:
-        extension = extension.lower()
-
-        if extension not in {".jpg", ".png"}:
-            extension = ".jpg"
+    if extension not in ALLOWED_EXTENSIONS:
+        extension = ".jpg"
 
     token = secrets.token_urlsafe(24).replace("/", "_")
 
-    return token + (extension or "")
+    return token + extension
 
 
 async def save_temp_file(
@@ -74,7 +68,7 @@ async def save_temp_file(
     if not isinstance(data, (bytes, bytearray)):
         raise ValueError("Temporary file data must be bytes.")
 
-    if content_type not in {"image/jpeg", "image/png"}:
+    if content_type not in ALLOWED_CONTENT_TYPES:
         raise ValueError("Unsupported temporary file content type.")
 
     if expires_at.tzinfo is None:
@@ -85,17 +79,17 @@ async def save_temp_file(
     try:
         path.write_bytes(bytes(data))
 
-        # Use the requested expiration time as the file's
-        # modification time so cleanup can enforce the
-        # exact expiry requested by the caller.
         expiry_timestamp = expires_at.timestamp()
+
         os.utime(
             path,
             (expiry_timestamp, expiry_timestamp),
         )
 
     except OSError as exc:
-        raise RuntimeError("Could not save temporary file.") from exc
+        raise RuntimeError(
+            "Could not save temporary file."
+        ) from exc
 
     return {
         "file_id": file_id,
@@ -131,14 +125,14 @@ async def get_temp_file(file_id: str):
     except OSError:
         return None
 
-    ext = path.suffix.lower()
+    extension = path.suffix.lower()
 
-    if ext not in {".jpg", ".png"}:
+    if extension not in ALLOWED_EXTENSIONS:
         return None
 
     content_type = (
         "image/png"
-        if ext == ".png"
+        if extension == ".png"
         else "image/jpeg"
     )
 
@@ -163,7 +157,7 @@ async def read_temp_file(file_id: str):
         return None
 
 
-async def delete_temp_file(file_id: str):
+async def delete_temp_file(file_id: str) -> None:
     if not _valid_file_id(file_id):
         return
 
