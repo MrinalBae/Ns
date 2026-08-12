@@ -195,13 +195,15 @@ def _parse_custom(text: str):
 
 async def _safe_answer_callback(q):
     """
-    Answer Telegram callback query.
+    Answer Telegram callback query safely.
 
-    If Telegram says the callback query is too old/invalid,
-    ignore that error and continue the actual operation.
-    This is important because q.answer() must never prevent
-    upscale/remove/expand from running.
+    Telegram can return:
+        Query is too old and response timeout expired
+        or query id is invalid
+
+    This error must not stop the actual image operation.
     """
+
     try:
         await q.answer()
 
@@ -225,7 +227,8 @@ async def callback(update, context):
         return
 
     # IMPORTANT:
-    # An expired callback answer must NOT stop the operation.
+    # Never allow an expired callback query to stop
+    # the actual image operation.
     await _safe_answer_callback(q)
 
     d = q.data
@@ -255,7 +258,15 @@ async def callback(update, context):
         )
 
     elif d.startswith("upscale:"):
-        scale = int(d.split(":", 1)[1])
+        try:
+            scale = int(
+                d.split(":", 1)[1]
+            )
+        except (ValueError, IndexError):
+            await q.message.reply_text(
+                "❌ Invalid upscale scale."
+            )
+            return
 
         await run_operation(
             update,
@@ -265,7 +276,15 @@ async def callback(update, context):
         )
 
     elif d.startswith("remove:"):
-        scale = int(d.split(":", 1)[1])
+        try:
+            scale = int(
+                d.split(":", 1)[1]
+            )
+        except (ValueError, IndexError):
+            await q.message.reply_text(
+                "❌ Invalid remove scale."
+            )
+            return
 
         await run_operation(
             update,
@@ -281,8 +300,8 @@ async def callback(update, context):
             context.user_data["expand_wait"] = "custom"
 
             await q.message.reply_text(
-                "Send custom target width × height, "
-                "e.g. 1920 x 1080."
+                "Send custom target width × height,\n"
+                "Example: 1920 x 1080"
             )
 
         else:
@@ -294,7 +313,9 @@ async def callback(update, context):
             )
 
     elif d.startswith("side:"):
-        context.user_data["side"] = d.split(":", 1)[1]
+        side = d.split(":", 1)[1]
+
+        context.user_data["side"] = side
 
         if context.user_data.get("ratio"):
             await prepare_ratio_expand(
@@ -311,7 +332,15 @@ async def callback(update, context):
             )
 
     elif d.startswith("expandscale:"):
-        scale = int(d.split(":", 1)[1])
+        try:
+            scale = int(
+                d.split(":", 1)[1]
+            )
+        except (ValueError, IndexError):
+            await q.message.reply_text(
+                "❌ Invalid expand scale."
+            )
+            return
 
         await run_operation(
             update,
@@ -328,9 +357,17 @@ async def callback(update, context):
         )
 
 
-async def prepare_ratio_expand(update, context):
+async def prepare_ratio_expand(
+    update,
+    context,
+):
+    file_id = context.user_data.get(
+        "file_id",
+        "",
+    )
+
     record = await get_temp_file(
-        context.user_data.get("file_id", "")
+        file_id
     )
 
     if not record:
@@ -340,7 +377,7 @@ async def prepare_ratio_expand(update, context):
         return
 
     raw = await read_temp_file(
-        context.user_data.get("file_id", "")
+        file_id
     )
 
     if not raw:
@@ -351,7 +388,9 @@ async def prepare_ratio_expand(update, context):
 
     _, image_bytes = raw
 
-    width, height, _ = image_info(image_bytes)
+    width, height, _ = image_info(
+        image_bytes
+    )
 
     ratio = context.user_data["ratio"]
 
@@ -382,7 +421,8 @@ async def prepare_ratio_expand(update, context):
 
     except ValueError as exc:
         await update.callback_query.message.reply_text(
-            f"❌ {exc}\nChoose another side or ratio."
+            f"❌ {exc}\n"
+            "Choose another side or ratio."
         )
         return
 
@@ -397,16 +437,23 @@ async def prepare_ratio_expand(update, context):
     )
 
 
-async def text(update, context):
-    wait = context.user_data.get("expand_wait")
+async def text(
+    update,
+    context,
+):
+    wait = context.user_data.get(
+        "expand_wait"
+    )
 
     if not wait:
         return False
 
     try:
         if wait == "custom":
-            context.user_data["custom_size"] = _parse_custom(
-                update.message.text
+            context.user_data["custom_size"] = (
+                _parse_custom(
+                    update.message.text
+                )
             )
 
             context.user_data["ratio"] = "custom"
@@ -429,7 +476,9 @@ async def text(update, context):
             if not 1 <= amount <= 2000:
                 raise ValueError
 
-            context.user_data["expand_amount"] = amount
+            context.user_data["expand_amount"] = (
+                amount
+            )
 
             context.user_data.pop(
                 "expand_wait",
@@ -457,8 +506,13 @@ async def run_operation(
 ):
     q = update.callback_query
 
+    file_id = context.user_data.get(
+        "file_id",
+        "",
+    )
+
     record = await get_temp_file(
-        context.user_data.get("file_id", "")
+        file_id
     )
 
     if not record:
@@ -470,10 +524,18 @@ async def run_operation(
     intermediate_id = None
 
     try:
+        # ---------------------------------------------
+        # Validate scale
+        # ---------------------------------------------
+
         if scale not in (2, 4):
             raise ValueError(
                 "Scale must be 2 or 4."
             )
+
+        # ---------------------------------------------
+        # Validate public URL
+        # ---------------------------------------------
 
         if not settings.public_base_url:
             raise RuntimeError(
@@ -482,12 +544,13 @@ async def run_operation(
 
         image_url = (
             f"{settings.public_base_url}"
-            f"/media/{record['file_id']}"
+            f"/media/{file_id}"
         )
 
-        # --------------------------------------------------
+        # =============================================
         # UPSCALE
-        # --------------------------------------------------
+        # =============================================
+
         if operation == "upscale":
 
             await q.message.reply_text(
@@ -500,9 +563,10 @@ async def run_operation(
                 scale,
             )
 
-        # --------------------------------------------------
+        # =============================================
         # REMOVE BACKGROUND
-        # --------------------------------------------------
+        # =============================================
+
         elif operation == "remove":
 
             await q.message.reply_text(
@@ -513,7 +577,10 @@ async def run_operation(
                 image_url
             )
 
+            # -----------------------------------------
             # Remove BG -> Upscale
+            # -----------------------------------------
+
             if scale in (2, 4):
 
                 await q.message.reply_text(
@@ -551,17 +618,18 @@ async def run_operation(
                     scale,
                 )
 
-        # --------------------------------------------------
+        # =============================================
         # EXPAND
-        # --------------------------------------------------
-        else:
+        # =============================================
+
+        elif operation == "expand":
 
             await q.message.reply_text(
                 "⏳ Expanding image..."
             )
 
             raw = await read_temp_file(
-                record["file_id"]
+                file_id
             )
 
             if not raw:
@@ -575,11 +643,21 @@ async def run_operation(
                 original_bytes
             )
 
+            # -----------------------------------------
+            # Target size from ratio
+            # -----------------------------------------
+
             if "target_size" in context.user_data:
 
                 target_w, target_h = (
-                    context.user_data["target_size"]
+                    context.user_data[
+                        "target_size"
+                    ]
                 )
+
+            # -----------------------------------------
+            # Target size from amount
+            # -----------------------------------------
 
             elif "expand_amount" in context.user_data:
 
@@ -587,15 +665,23 @@ async def run_operation(
                     "expand_amount"
                 ]
 
-                side = context.user_data["side"]
+                side = context.user_data.get(
+                    "side"
+                )
 
                 target_w = width
                 target_h = height
 
-                if side in ("left", "right"):
+                if side in (
+                    "left",
+                    "right",
+                ):
                     target_w += amount
 
-                elif side in ("top", "bottom"):
+                elif side in (
+                    "top",
+                    "bottom",
+                ):
                     target_h += amount
 
                 else:
@@ -607,20 +693,33 @@ async def run_operation(
                     "Expand settings are incomplete."
                 )
 
+            side = context.user_data.get(
+                "side"
+            )
+
+            if not side:
+                raise RuntimeError(
+                    "Expand side is missing."
+                )
+
             result, ctype = await expand(
                 image_url,
                 width,
                 height,
                 target_w,
                 target_h,
-                context.user_data["side"],
+                side,
             )
 
+            # -----------------------------------------
             # Expand -> Upscale
+            # -----------------------------------------
+
             if scale in (2, 4):
 
                 await q.message.reply_text(
-                    f"⏳ Upscaling expanded image {scale}×..."
+                    f"⏳ Upscaling expanded image "
+                    f"{scale}×..."
                 )
 
                 intermediate_ext = (
@@ -654,9 +753,15 @@ async def run_operation(
                     scale,
                 )
 
-        # --------------------------------------------------
+        else:
+            raise ValueError(
+                "Unknown image operation."
+            )
+
+        # =============================================
         # USER / BOT SETTINGS
-        # --------------------------------------------------
+        # =============================================
+
         user = await get_user_settings(
             update.effective_user.id
         )
@@ -675,14 +780,19 @@ async def run_operation(
             ),
         )
 
-        # --------------------------------------------------
+        # =============================================
         # CONVERT OUTPUT
-        # --------------------------------------------------
+        # =============================================
+
         result, out_ctype, ext = convert_output(
             result,
             fmt,
             quality,
         )
+
+        # =============================================
+        # FILENAME
+        # =============================================
 
         filename = normalize_filename(
             context.user_data.get(
@@ -693,12 +803,15 @@ async def run_operation(
             user["suffix"],
             scale,
             ext,
-            bool(user["scale_in_filename"]),
+            bool(
+                user["scale_in_filename"]
+            ),
         )
 
-        # --------------------------------------------------
+        # =============================================
         # THUMBNAIL
-        # --------------------------------------------------
+        # =============================================
+
         thumbnail_enabled = bool(
             user["thumbnail"]
             and bot["output"].get(
@@ -713,9 +826,10 @@ async def run_operation(
             else None
         )
 
-        # --------------------------------------------------
+        # =============================================
         # SEND RESULT
-        # --------------------------------------------------
+        # =============================================
+
         await q.message.reply_document(
             document=BytesIO(result),
             filename=filename,
@@ -728,7 +842,7 @@ async def run_operation(
                 else None
             ),
             caption=(
-                f"✅ "
+                "✅ "
                 f"{operation.replace('_', ' ').title()} "
                 f"{scale}× complete."
             ),
@@ -736,30 +850,45 @@ async def run_operation(
 
     except Exception as exc:
 
-        message = (
-            str(exc)
-            if isinstance(
-                exc,
-                (ValueError, RuntimeError),
+        # ---------------------------------------------
+        # Get useful error message
+        # ---------------------------------------------
+
+        if isinstance(
+            exc,
+            (ValueError, RuntimeError),
+        ):
+            message = str(exc)
+
+        else:
+            message = (
+                "Processing failed."
             )
-            else "Processing failed."
-        )
 
         try:
             await q.message.reply_text(
                 f"❌ {message}"
             )
+
         except Exception:
             pass
 
     finally:
 
+        # ---------------------------------------------
+        # Delete original temporary file
+        # ---------------------------------------------
+
         try:
             await delete_temp_file(
-                record["file_id"]
+                file_id
             )
         except Exception:
             pass
+
+        # ---------------------------------------------
+        # Delete intermediate file
+        # ---------------------------------------------
 
         if intermediate_id:
             try:
@@ -768,5 +897,9 @@ async def run_operation(
                 )
             except Exception:
                 pass
+
+        # ---------------------------------------------
+        # Clear user state
+        # ---------------------------------------------
 
         context.user_data.clear()
