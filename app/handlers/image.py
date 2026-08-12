@@ -6,7 +6,7 @@ from telegram.ext import ContextTypes
 from PIL import Image
 from app.config import settings
 from app.database import get_bot_settings, get_user_settings
-from app.temp_storage import new_file_id, save_temp_file, get_temp_file, delete_temp_file
+from app.temp_storage import new_file_id, save_temp_file, get_temp_file, read_temp_file, delete_temp_file
 from app.image_utils import validate_image, image_info, convert_output, make_thumbnail, normalize_filename
 from app.keyboards import operations, scales, ratios, sides
 from app.services.upscale import upscale
@@ -122,7 +122,12 @@ async def prepare_ratio_expand(update, context):
     if not record:
         await update.callback_query.message.reply_text("Image expired. Send it again.")
         return
-    width, height = image_info(record["data"])
+    raw = await read_temp_file(context.user_data.get("file_id", ""))
+    if not raw:
+        await update.callback_query.message.reply_text("Image expired. Send it again.")
+        return
+    _, image_bytes = raw
+    width, height = image_info(image_bytes)
     ratio = context.user_data["ratio"]
     if ratio in RATIOS:
         target_w, target_h = _target_dimensions(width, height, ratio)
@@ -130,14 +135,6 @@ async def prepare_ratio_expand(update, context):
         target_w, target_h = context.user_data["custom_size"]
     side = context.user_data["side"]
     try:
-        # For one-sided expansion, keep the opposite dimension unchanged.
-        if side in {"left", "right"}:
-            target_h = height
-            target_w = max(width, target_w)
-        elif side in {"top", "bottom"}:
-            target_w = width
-            target_h = max(height, target_h)
-        # all sides can reach the full target canvas.
         from app.services.expand import build_expansion
         build_expansion(width, height, target_w, target_h, side)
     except ValueError as exc:
@@ -154,7 +151,6 @@ async def text(update, context):
         if wait == "custom":
             context.user_data["custom_size"] = _parse_custom(update.message.text)
             context.user_data.pop("expand_wait", None)
-            # Custom dimensions still require the side selection.
             await update.message.reply_text("Choose which side to expand.", reply_markup=sides())
         elif wait == "amount":
             amount = int(update.message.text.strip())
@@ -189,7 +185,11 @@ async def run_operation(update, context, scale, operation):
                                       datetime.now(timezone.utc) + timedelta(minutes=10))
                 result, ctype = await upscale(f"{settings.public_base_url}/media/{intermediate_id}", scale)
         else:
-            width, height = image_info(record["data"])
+            raw = await read_temp_file(record["file_id"])
+            if not raw:
+                raise RuntimeError("Image expired. Send it again.")
+            _, original_bytes = raw
+            width, height = image_info(original_bytes)
             if "target_size" in context.user_data:
                 target_w, target_h = context.user_data["target_size"]
             elif "expand_amount" in context.user_data:
