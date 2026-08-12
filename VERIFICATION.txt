@@ -1,29 +1,24 @@
-Image AI Telegram Bot V7
+Image AI Telegram Bot — Final V8
 
-This package contains the complete V6 source plus this verification manifest.
-Python cache artifacts (__pycache__/ and *.pyc) are intentionally excluded.
+Source reviewed against the public MrinalBae/Nw repository and corrected before packaging.
 
-PACKAGED FILES:
-.gitignore
-README.md
-app/__init__.py
-app/config.py
-app/database.py
-app/handlers/__init__.py
-app/handlers/admin.py
-app/handlers/image.py
-app/handlers/settings.py
-app/handlers/start.py
-app/image_utils.py
-app/keyboards.py
-app/main.py
-app/security.py
-app/services/__init__.py
-app/services/expand.py
-app/services/pixelcut.py
-app/services/remove_bg.py
-app/services/upscale.py
-app/telegram.py
-app/temp_storage.py
-render.yaml
-requirements.txt
+Critical corrections:
+- Removed the invalid get_temp_file import from app.database in main.py.
+- /media now reads temporary image bytes from the filesystem safely.
+- Image processing no longer accesses a nonexistent record["data"] field.
+- Custom Expand dimensions now correctly proceed to side selection and scale selection.
+- Ratio Expand validates side compatibility instead of silently changing the requested target.
+- Temporary file IDs are path-safe and expired files are removed.
+- Multiple Pixelcut API records have no fixed 10-key limit in database retrieval.
+- Render runs FastAPI directly on 0.0.0.0:$PORT.
+- No React/Vite/Node/npm/pnpm build artifacts are included.
+
+Static verification performed:
+- 19 Python source files parsed and compiled successfully.
+- Required files verified.
+- No .pyc or __pycache__ files packaged.
+- ZIP integrity test passed.
+- Forbidden frontend build commands absent from application source.
+- Pixelcut endpoints/request format checked against current official Pixelcut documentation.
+
+Live third-party E2E testing cannot be honestly claimed without the owner's Telegram token, MongoDB URI and Pixelcut API credentials.

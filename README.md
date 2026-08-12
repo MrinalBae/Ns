@@ -331,6 +331,10 @@ Before deployment, verify:
 - Filename settings
 - Thumbnail settings
 
+## Verification status
+
+The package includes static Python compilation and source-consistency checks. Live Telegram, MongoDB, Render and Pixelcut calls require real deployment credentials and network access.
+
 ## Important
 
 Real Pixelcut processing requires a valid Pixelcut API key with available API credits.
