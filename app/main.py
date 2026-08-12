@@ -4,17 +4,16 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import Response, JSONResponse
 from app.config import settings
-from app.database import connect, close, get_temp_file
+from app.database import connect, close
+from app.temp_storage import cleanup_expired, read_temp_file
 
 telegram_app = None
 _uptime_task = None
 
 async def _uptime_loop():
-    if not settings.uptime_url:
-        return
-    while True:
+    while settings.uptime_url:
         try:
-            async with httpx.AsyncClient(timeout=15) as client:
+            async with httpx.AsyncClient(timeout=10) as client:
                 await client.get(settings.uptime_url)
         except Exception:
             pass
@@ -23,19 +22,20 @@ async def _uptime_loop():
 @asynccontextmanager
 async def lifespan(app):
     global telegram_app, _uptime_task
-    from app.telegram import build_application
-    from app.temp_storage import cleanup_expired
     cleanup_expired()
-    await connect()
-    telegram_app = build_application()
-    await telegram_app.initialize()
-    await telegram_app.start()
-    if settings.public_base_url:
-        await telegram_app.bot.set_webhook(
-            url=settings.public_base_url + "/telegram/webhook",
-            secret_token=settings.webhook_secret or None,
-            drop_pending_updates=False,
-        )
+    if settings.mongodb_uri:
+        await connect()
+    if settings.telegram_bot_token and settings.mongodb_uri:
+        from app.telegram import build_application
+        telegram_app = build_application()
+        await telegram_app.initialize()
+        await telegram_app.start()
+        if settings.public_base_url:
+            await telegram_app.bot.set_webhook(
+                url=settings.public_base_url + "/telegram/webhook",
+                secret_token=settings.webhook_secret or None,
+                drop_pending_updates=False,
+            )
     if settings.uptime_url:
         _uptime_task = asyncio.create_task(_uptime_loop())
     yield
@@ -50,14 +50,13 @@ async def lifespan(app):
         await telegram_app.shutdown()
     await close()
 
-app = FastAPI(title="Image AI Telegram Bot", version="6.0.0", lifespan=lifespan)
+app = FastAPI(title="Image AI Telegram Bot", version="7.1.0", lifespan=lifespan)
 
 @app.get("/")
 async def root():
-    return {"service": "Image AI Telegram Bot", "status": "ok"}
+    return {"service": "Image AI Telegram Bot", "status": "ok", "telegram": telegram_app is not None}
 
 @app.get("/api/healthz")
-@app.get("/healthz", include_in_schema=False)
 async def healthz():
     return {"status": "ok"}
 
@@ -67,12 +66,13 @@ async def status():
 
 @app.get("/media/{file_id}")
 async def media(file_id: str):
-    record = await get_temp_file(file_id)
-    if not record:
+    raw = await read_temp_file(file_id)
+    if not raw:
         return JSONResponse({"error": "not found"}, status_code=404)
+    meta, data = raw
     return Response(
-        record["data"],
-        media_type=record["content_type"],
+        data,
+        media_type=meta["content_type"],
         headers={"Cache-Control": "no-store, no-cache", "X-Robots-Tag": "noindex, nofollow"},
     )
 

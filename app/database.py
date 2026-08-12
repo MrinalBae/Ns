@@ -109,7 +109,7 @@ async def add_api(label: str, encrypted: str):
     })
 
 async def list_apis():
-    return await get_db().apis.find().sort([("created_at", 1)]).to_list(length=10000)
+    return await get_db().apis.find().sort([("created_at", 1)]).to_list(length=None)
 
 def _oid(oid: str):
     try:
