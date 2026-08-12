@@ -1,0 +1,29 @@
+Image AI Telegram Bot V7
+
+This package contains the complete V6 source plus this verification manifest.
+Python cache artifacts (__pycache__/ and *.pyc) are intentionally excluded.
+
+PACKAGED FILES:
+.gitignore
+README.md
+app/__init__.py
+app/config.py
+app/database.py
+app/handlers/__init__.py
+app/handlers/admin.py
+app/handlers/image.py
+app/handlers/settings.py
+app/handlers/start.py
+app/image_utils.py
+app/keyboards.py
+app/main.py
+app/security.py
+app/services/__init__.py
+app/services/expand.py
+app/services/pixelcut.py
+app/services/remove_bg.py
+app/services/upscale.py
+app/telegram.py
+app/temp_storage.py
+render.yaml
+requirements.txt
