@@ -5,6 +5,7 @@ import math
 from io import BytesIO
 
 from telegram import Update, InputFile
+from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
 from app.config import settings
@@ -133,6 +134,7 @@ async def receive(
         )
 
         context.user_data.clear()
+
         context.user_data["file_id"] = file_id
         context.user_data["name"] = name
 
@@ -158,6 +160,7 @@ def _target_dimensions(
     if width / height > target_ratio:
         tw = width
         th = math.ceil(width / target_ratio)
+
     else:
         th = height
         tw = math.ceil(height * target_ratio)
@@ -190,10 +193,40 @@ def _parse_custom(text: str):
     return w, h
 
 
+async def _safe_answer_callback(q):
+    """
+    Answer Telegram callback query.
+
+    If Telegram says the callback query is too old/invalid,
+    ignore that error and continue the actual operation.
+    This is important because q.answer() must never prevent
+    upscale/remove/expand from running.
+    """
+    try:
+        await q.answer()
+
+    except BadRequest as exc:
+        message = str(exc).lower()
+
+        if (
+            "query is too old" in message
+            or "query id is invalid" in message
+            or "response timeout expired" in message
+        ):
+            return
+
+        raise
+
+
 async def callback(update, context):
     q = update.callback_query
 
-    await q.answer()
+    if not q:
+        return
+
+    # IMPORTANT:
+    # An expired callback answer must NOT stop the operation.
+    await _safe_answer_callback(q)
 
     d = q.data
 
@@ -222,18 +255,22 @@ async def callback(update, context):
         )
 
     elif d.startswith("upscale:"):
+        scale = int(d.split(":", 1)[1])
+
         await run_operation(
             update,
             context,
-            int(d.split(":")[1]),
+            scale,
             "upscale",
         )
 
     elif d.startswith("remove:"):
+        scale = int(d.split(":", 1)[1])
+
         await run_operation(
             update,
             context,
-            int(d.split(":")[1]),
+            scale,
             "remove",
         )
 
@@ -264,6 +301,7 @@ async def callback(update, context):
                 update,
                 context,
             )
+
         else:
             context.user_data["expand_wait"] = "amount"
 
@@ -273,10 +311,12 @@ async def callback(update, context):
             )
 
     elif d.startswith("expandscale:"):
+        scale = int(d.split(":", 1)[1])
+
         await run_operation(
             update,
             context,
-            int(d.split(":")[1]),
+            scale,
             "expand",
         )
 
@@ -321,6 +361,7 @@ async def prepare_ratio_expand(update, context):
             height,
             ratio,
         )
+
     else:
         target_w, target_h = context.user_data[
             "custom_size"
@@ -429,6 +470,11 @@ async def run_operation(
     intermediate_id = None
 
     try:
+        if scale not in (2, 4):
+            raise ValueError(
+                "Scale must be 2 or 4."
+            )
+
         if not settings.public_base_url:
             raise RuntimeError(
                 "PUBLIC_BASE_URL is not configured."
@@ -439,18 +485,41 @@ async def run_operation(
             f"/media/{record['file_id']}"
         )
 
+        # --------------------------------------------------
+        # UPSCALE
+        # --------------------------------------------------
         if operation == "upscale":
+
+            await q.message.reply_text(
+                f"⏳ Upscaling image {scale}×...\n"
+                "Please wait."
+            )
+
             result, ctype = await upscale(
                 image_url,
                 scale,
             )
 
+        # --------------------------------------------------
+        # REMOVE BACKGROUND
+        # --------------------------------------------------
         elif operation == "remove":
+
+            await q.message.reply_text(
+                "⏳ Removing background..."
+            )
+
             result, ctype = await remove_background(
                 image_url
             )
 
+            # Remove BG -> Upscale
             if scale in (2, 4):
+
+                await q.message.reply_text(
+                    f"⏳ Upscaling result {scale}×..."
+                )
+
                 intermediate_ext = (
                     ".png"
                     if ctype == "image/png"
@@ -482,7 +551,15 @@ async def run_operation(
                     scale,
                 )
 
+        # --------------------------------------------------
+        # EXPAND
+        # --------------------------------------------------
         else:
+
+            await q.message.reply_text(
+                "⏳ Expanding image..."
+            )
+
             raw = await read_temp_file(
                 record["file_id"]
             )
@@ -499,11 +576,13 @@ async def run_operation(
             )
 
             if "target_size" in context.user_data:
+
                 target_w, target_h = (
                     context.user_data["target_size"]
                 )
 
             elif "expand_amount" in context.user_data:
+
                 amount = context.user_data[
                     "expand_amount"
                 ]
@@ -537,7 +616,13 @@ async def run_operation(
                 context.user_data["side"],
             )
 
+            # Expand -> Upscale
             if scale in (2, 4):
+
+                await q.message.reply_text(
+                    f"⏳ Upscaling expanded image {scale}×..."
+                )
+
                 intermediate_ext = (
                     ".png"
                     if ctype == "image/png"
@@ -569,6 +654,9 @@ async def run_operation(
                     scale,
                 )
 
+        # --------------------------------------------------
+        # USER / BOT SETTINGS
+        # --------------------------------------------------
         user = await get_user_settings(
             update.effective_user.id
         )
@@ -587,6 +675,9 @@ async def run_operation(
             ),
         )
 
+        # --------------------------------------------------
+        # CONVERT OUTPUT
+        # --------------------------------------------------
         result, out_ctype, ext = convert_output(
             result,
             fmt,
@@ -605,6 +696,9 @@ async def run_operation(
             bool(user["scale_in_filename"]),
         )
 
+        # --------------------------------------------------
+        # THUMBNAIL
+        # --------------------------------------------------
         thumbnail_enabled = bool(
             user["thumbnail"]
             and bot["output"].get(
@@ -619,6 +713,9 @@ async def run_operation(
             else None
         )
 
+        # --------------------------------------------------
+        # SEND RESULT
+        # --------------------------------------------------
         await q.message.reply_document(
             document=BytesIO(result),
             filename=filename,
@@ -633,11 +730,12 @@ async def run_operation(
             caption=(
                 f"✅ "
                 f"{operation.replace('_', ' ').title()} "
-                f"complete."
+                f"{scale}× complete."
             ),
         )
 
     except Exception as exc:
+
         message = (
             str(exc)
             if isinstance(
@@ -647,18 +745,28 @@ async def run_operation(
             else "Processing failed."
         )
 
-        await q.message.reply_text(
-            f"❌ {message}"
-        )
+        try:
+            await q.message.reply_text(
+                f"❌ {message}"
+            )
+        except Exception:
+            pass
 
     finally:
-        await delete_temp_file(
-            record["file_id"]
-        )
+
+        try:
+            await delete_temp_file(
+                record["file_id"]
+            )
+        except Exception:
+            pass
 
         if intermediate_id:
-            await delete_temp_file(
-                intermediate_id
-            )
+            try:
+                await delete_temp_file(
+                    intermediate_id
+                )
+            except Exception:
+                pass
 
         context.user_data.clear()
