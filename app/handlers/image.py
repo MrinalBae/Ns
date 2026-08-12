@@ -1,11 +1,12 @@
 # app/handlers/image.py
 
 from datetime import datetime, timedelta, timezone
+import logging
 import math
 from io import BytesIO
 
 from telegram import Update, InputFile
-from telegram.error import BadRequest
+from telegram.error import BadRequest, TelegramError
 from telegram.ext import ContextTypes
 
 from app.config import settings
@@ -30,6 +31,9 @@ from app.services.remove_bg import remove_background
 from app.services.expand import expand
 
 
+logger = logging.getLogger(__name__)
+
+
 RATIOS = {
     "1:1": (1, 1),
     "4:3": (4, 3),
@@ -42,37 +46,57 @@ RATIOS = {
 }
 
 
+# ============================================================
+# RECEIVE IMAGE
+# ============================================================
+
 async def receive(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    bot = await get_bot_settings()
-
-    configured_limit = int(
-        bot["processing"].get(
-            "max_upload_mb",
-            settings.default_max_upload_mb,
-        )
-    )
-
-    limit_mb = min(
-        configured_limit,
-        settings.default_max_upload_mb,
-        20,
-    )
-
-    limit = limit_mb * 1024 * 1024
-
-    doc = update.message.document
-    photo = (
-        update.message.photo[-1]
-        if update.message.photo
-        else None
-    )
+    if not update.message:
+        return
 
     try:
+        bot = await get_bot_settings()
+
+        processing = bot.get("processing") or {}
+
+        configured_limit = int(
+            processing.get(
+                "max_upload_mb",
+                settings.default_max_upload_mb,
+            )
+        )
+
+        limit_mb = min(
+            configured_limit,
+            settings.default_max_upload_mb,
+            20,
+        )
+
+        limit = limit_mb * 1024 * 1024
+
+        doc = update.message.document
+
+        photo = (
+            update.message.photo[-1]
+            if update.message.photo
+            else None
+        )
+
+        # ----------------------------------------------------
+        # DOCUMENT
+        # ----------------------------------------------------
+
         if doc:
-            if doc.mime_type not in (
+            mime_type = (
+                (doc.mime_type or "")
+                .strip()
+                .lower()
+            )
+
+            if mime_type not in (
                 "image/jpeg",
                 "image/png",
             ):
@@ -93,6 +117,10 @@ async def receive(
 
             name = doc.file_name or "image.jpg"
 
+        # ----------------------------------------------------
+        # TELEGRAM PHOTO
+        # ----------------------------------------------------
+
         elif photo:
             tg_file = await photo.get_file()
 
@@ -105,9 +133,18 @@ async def receive(
         else:
             return
 
-        validate_image(data, limit)
+        # ----------------------------------------------------
+        # VALIDATE ACTUAL IMAGE DATA
+        # ----------------------------------------------------
 
-        width, height, image_format = image_info(data)
+        validate_image(
+            data,
+            limit,
+        )
+
+        width, height, image_format = image_info(
+            data
+        )
 
         if image_format == "PNG":
             ctype = "image/png"
@@ -122,6 +159,10 @@ async def receive(
                 "Only JPG/JPEG/PNG images are supported."
             )
 
+        # ----------------------------------------------------
+        # SAVE TEMP FILE
+        # ----------------------------------------------------
+
         file_id = new_file_id(extension)
 
         await save_temp_file(
@@ -133,10 +174,17 @@ async def receive(
             + timedelta(minutes=15),
         )
 
+        # ----------------------------------------------------
+        # RESET USER STATE
+        # ----------------------------------------------------
+
         context.user_data.clear()
 
         context.user_data["file_id"] = file_id
         context.user_data["name"] = name
+
+        context.user_data["width"] = width
+        context.user_data["height"] = height
 
         await update.message.reply_text(
             "Choose an operation:",
@@ -144,65 +192,121 @@ async def receive(
         )
 
     except Exception as exc:
-        await update.message.reply_text(
-            f"❌ {exc}"
+        logger.exception(
+            "Image receive failed"
         )
 
+        try:
+            await update.message.reply_text(
+                f"❌ {exc}"
+            )
+        except Exception:
+            logger.exception(
+                "Failed to send receive error message"
+            )
+
+
+# ============================================================
+# RATIO HELPERS
+# ============================================================
 
 def _target_dimensions(
     width: int,
     height: int,
     ratio: str,
 ):
+    if ratio not in RATIOS:
+        raise ValueError(
+            "Invalid target ratio."
+        )
+
     rw, rh = RATIOS[ratio]
+
     target_ratio = rw / rh
+
+    if width <= 0 or height <= 0:
+        raise ValueError(
+            "Invalid image dimensions."
+        )
 
     if width / height > target_ratio:
         tw = width
-        th = math.ceil(width / target_ratio)
+        th = math.ceil(
+            width / target_ratio
+        )
 
     else:
         th = height
-        tw = math.ceil(height * target_ratio)
+        tw = math.ceil(
+            height * target_ratio
+        )
 
     return int(tw), int(th)
 
 
 def _parse_custom(text: str):
+    if not text:
+        raise ValueError(
+            "Invalid dimensions."
+        )
+
     raw = (
         text
+        .strip()
         .lower()
         .replace("×", "x")
         .replace(" ", "")
     )
 
     if "x" not in raw:
-        raise ValueError
+        raise ValueError(
+            "Use WIDTH x HEIGHT."
+        )
 
-    w, h = raw.split("x", 1)
+    parts = raw.split("x")
 
-    w = int(w)
-    h = int(h)
+    if len(parts) != 2:
+        raise ValueError(
+            "Use WIDTH x HEIGHT."
+        )
+
+    try:
+        width = int(parts[0])
+        height = int(parts[1])
+    except ValueError:
+        raise ValueError(
+            "Width and height must be numbers."
+        )
 
     if not (
-        128 <= w <= 6000
-        and 128 <= h <= 6000
+        128 <= width <= 6000
+        and 128 <= height <= 6000
     ):
-        raise ValueError
+        raise ValueError(
+            "Width and height must be between 128 and 6000 pixels."
+        )
 
-    return w, h
+    return width, height
 
+
+# ============================================================
+# SAFE TELEGRAM CALLBACK ANSWER
+# ============================================================
 
 async def _safe_answer_callback(q):
     """
-    Answer Telegram callback query safely.
+    Telegram callback queries expire quickly.
 
-    Telegram can return:
-        Query is too old and response timeout expired
-        or query id is invalid
+    If Telegram returns:
+        Query is too old
+        response timeout expired
+        query id is invalid
 
-    This error must not stop the actual image operation.
+    the actual operation must still continue.
     """
+
+    if not q:
+        return
 
     try:
         await q.answer()
@@ -210,205 +314,465 @@ async def _safe_answer_callback(q):
     except BadRequest as exc:
         message = str(exc).lower()
 
-        if (
-            "query is too old" in message
-            or "query id is invalid" in message
-            or "response timeout expired" in message
+        expired_messages = (
+            "query is too old",
+            "response timeout expired",
+            "query id is invalid",
+        )
+
+        if any(
+            item in message
+            for item in expired_messages
         ):
+            logger.warning(
+                "Ignoring expired Telegram callback: %s",
+                exc,
+            )
             return
 
         raise
 
+    except TelegramError:
+        # Other Telegram errors should not silently
+        # disappear.
+        logger.exception(
+            "Telegram callback answer failed"
+        )
+        raise
 
-async def callback(update, context):
+
+# ============================================================
+# SAFE MESSAGE EDIT
+# ============================================================
+
+async def _safe_edit(
+    q,
+    text,
+    reply_markup=None,
+):
+    """
+    Editing an old/already-edited Telegram message can fail.
+    Do not let that kill the whole callback handler.
+    """
+
+    if not q:
+        return False
+
+    try:
+        await q.edit_message_text(
+            text=text,
+            reply_markup=reply_markup,
+        )
+
+        return True
+
+    except BadRequest as exc:
+        message = str(exc).lower()
+
+        if (
+            "message is not modified" in message
+            or "message to edit not found" in message
+            or "query is too old" in message
+        ):
+            logger.warning(
+                "Ignoring Telegram edit error: %s",
+                exc,
+            )
+            return False
+
+        raise
+
+
+# ============================================================
+# CALLBACK
+# ============================================================
+
+async def callback(
+    update,
+    context,
+):
     q = update.callback_query
 
     if not q:
         return
 
     # IMPORTANT:
-    # Never allow an expired callback query to stop
-    # the actual image operation.
-    await _safe_answer_callback(q)
-
-    d = q.data
-
-    if d == "op:remove":
-        context.user_data["operation"] = "remove"
-
-        await q.edit_message_text(
-            "Remove BG — choose result scale.",
-            reply_markup=scales("remove"),
+    # This must NEVER prevent the actual image operation.
+    try:
+        await _safe_answer_callback(q)
+    except Exception:
+        # Log it, but continue processing the callback.
+        logger.exception(
+            "Callback answer failed; continuing operation"
         )
 
-    elif d == "op:upscale":
-        context.user_data["operation"] = "upscale"
+    d = q.data or ""
 
-        await q.edit_message_text(
-            "Upscale — choose scale.",
-            reply_markup=scales("upscale"),
-        )
+    try:
 
-    elif d == "op:expand":
-        context.user_data["operation"] = "expand"
+        # ----------------------------------------------------
+        # REMOVE BG
+        # ----------------------------------------------------
 
-        await q.edit_message_text(
-            "Expand — choose target ratio.",
-            reply_markup=ratios(),
-        )
+        if d == "op:remove":
 
-    elif d.startswith("upscale:"):
-        try:
-            scale = int(
-                d.split(":", 1)[1]
-            )
-        except (ValueError, IndexError):
-            await q.message.reply_text(
-                "❌ Invalid upscale scale."
-            )
-            return
+            context.user_data["operation"] = "remove"
 
-        await run_operation(
-            update,
-            context,
-            scale,
-            "upscale",
-        )
-
-    elif d.startswith("remove:"):
-        try:
-            scale = int(
-                d.split(":", 1)[1]
-            )
-        except (ValueError, IndexError):
-            await q.message.reply_text(
-                "❌ Invalid remove scale."
-            )
-            return
-
-        await run_operation(
-            update,
-            context,
-            scale,
-            "remove",
-        )
-
-    elif d.startswith("ratio:"):
-        ratio = d.split(":", 1)[1]
-
-        if ratio == "custom":
-            context.user_data["expand_wait"] = "custom"
-
-            await q.message.reply_text(
-                "Send custom target width × height,\n"
-                "Example: 1920 x 1080"
+            await _safe_edit(
+                q,
+                "Remove BG — choose result scale.",
+                scales("remove"),
             )
 
-        else:
-            context.user_data["ratio"] = ratio
+        # ----------------------------------------------------
+        # UPSCALE
+        # ----------------------------------------------------
 
-            await q.edit_message_text(
-                "Choose which side to expand.",
-                reply_markup=sides(),
+        elif d == "op:upscale":
+
+            context.user_data["operation"] = "upscale"
+
+            await _safe_edit(
+                q,
+                "Upscale — choose scale.",
+                scales("upscale"),
             )
 
-    elif d.startswith("side:"):
-        side = d.split(":", 1)[1]
+        # ----------------------------------------------------
+        # EXPAND
+        # ----------------------------------------------------
 
-        context.user_data["side"] = side
+        elif d == "op:expand":
 
-        if context.user_data.get("ratio"):
-            await prepare_ratio_expand(
+            context.user_data["operation"] = "expand"
+
+            await _safe_edit(
+                q,
+                "Expand — choose target ratio.",
+                ratios(),
+            )
+
+        # ----------------------------------------------------
+        # UPSCALE SCALE
+        # ----------------------------------------------------
+
+        elif d.startswith("upscale:"):
+
+            raw_scale = d.split(
+                ":",
+                1,
+            )[1]
+
+            try:
+                scale = int(raw_scale)
+            except (ValueError, TypeError):
+                await q.message.reply_text(
+                    "❌ Invalid upscale scale."
+                )
+                return
+
+            if scale not in (2, 4):
+                await q.message.reply_text(
+                    "❌ Upscale supports only 2× and 4×."
+                )
+                return
+
+            await run_operation(
                 update,
                 context,
+                scale,
+                "upscale",
             )
 
-        else:
-            context.user_data["expand_wait"] = "amount"
+        # ----------------------------------------------------
+        # REMOVE SCALE
+        # ----------------------------------------------------
 
-            await q.edit_message_text(
-                "Send expansion amount in pixels.\n"
-                "Example: 500"
+        elif d.startswith("remove:"):
+
+            raw_scale = d.split(
+                ":",
+                1,
+            )[1]
+
+            try:
+                scale = int(raw_scale)
+            except (ValueError, TypeError):
+                await q.message.reply_text(
+                    "❌ Invalid remove scale."
+                )
+                return
+
+            if scale not in (2, 4):
+                await q.message.reply_text(
+                    "❌ Result scale must be 2× or 4×."
+                )
+                return
+
+            await run_operation(
+                update,
+                context,
+                scale,
+                "remove",
             )
 
-    elif d.startswith("expandscale:"):
+        # ----------------------------------------------------
+        # RATIO
+        # ----------------------------------------------------
+
+        elif d.startswith("ratio:"):
+
+            ratio = d.split(
+                ":",
+                1,
+            )[1]
+
+            if ratio == "custom":
+
+                context.user_data[
+                    "expand_wait"
+                ] = "custom"
+
+                await q.message.reply_text(
+                    "Send custom target width × height.\n"
+                    "Example: 1920 x 1080"
+                )
+
+            else:
+
+                if ratio not in RATIOS:
+                    await q.message.reply_text(
+                        "❌ Invalid ratio."
+                    )
+                    return
+
+                context.user_data[
+                    "ratio"
+                ] = ratio
+
+                await _safe_edit(
+                    q,
+                    "Choose which side to expand.",
+                    sides(),
+                )
+
+        # ----------------------------------------------------
+        # SIDE
+        # ----------------------------------------------------
+
+        elif d.startswith("side:"):
+
+            side = d.split(
+                ":",
+                1,
+            )[1]
+
+            valid_sides = {
+                "left",
+                "right",
+                "top",
+                "bottom",
+                "all",
+            }
+
+            if side not in valid_sides:
+                await q.message.reply_text(
+                    "❌ Invalid expansion side."
+                )
+                return
+
+            context.user_data[
+                "side"
+            ] = side
+
+            if context.user_data.get("ratio"):
+
+                await prepare_ratio_expand(
+                    update,
+                    context,
+                )
+
+            else:
+
+                context.user_data[
+                    "expand_wait"
+                ] = "amount"
+
+                await _safe_edit(
+                    q,
+                    "Send expansion amount in pixels.\n"
+                    "Example: 500",
+                )
+
+        # ----------------------------------------------------
+        # EXPAND SCALE
+        # ----------------------------------------------------
+
+        elif d.startswith("expandscale:"):
+
+            raw_scale = d.split(
+                ":",
+                1,
+            )[1]
+
+            try:
+                scale = int(raw_scale)
+            except (ValueError, TypeError):
+                await q.message.reply_text(
+                    "❌ Invalid expand scale."
+                )
+                return
+
+            if scale not in (2, 4):
+                await q.message.reply_text(
+                    "❌ Result scale must be 2× or 4×."
+                )
+                return
+
+            await run_operation(
+                update,
+                context,
+                scale,
+                "expand",
+            )
+
+        # ----------------------------------------------------
+        # CANCEL
+        # ----------------------------------------------------
+
+        elif d == "cancel":
+
+            file_id = context.user_data.get(
+                "file_id"
+            )
+
+            if file_id:
+                try:
+                    await delete_temp_file(
+                        file_id
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to delete cancelled temp file"
+                    )
+
+            context.user_data.clear()
+
+            await _safe_edit(
+                q,
+                "Cancelled. Send another image.",
+            )
+
+    except Exception as exc:
+        logger.exception(
+            "Image callback failed: %s",
+            exc,
+        )
+
         try:
-            scale = int(
-                d.split(":", 1)[1]
-            )
-        except (ValueError, IndexError):
             await q.message.reply_text(
-                "❌ Invalid expand scale."
+                f"❌ {exc}"
             )
-            return
+        except Exception:
+            logger.exception(
+                "Failed to send callback error"
+            )
 
-        await run_operation(
-            update,
-            context,
-            scale,
-            "expand",
-        )
 
-    elif d == "cancel":
-        context.user_data.clear()
-
-        await q.edit_message_text(
-            "Cancelled. Send another image."
-        )
-
+# ============================================================
+# PREPARE RATIO EXPAND
+# ============================================================
 
 async def prepare_ratio_expand(
     update,
     context,
 ):
+    q = update.callback_query
+
     file_id = context.user_data.get(
         "file_id",
         "",
     )
 
-    record = await get_temp_file(
-        file_id
-    )
-
-    if not record:
-        await update.callback_query.message.reply_text(
-            "Image expired. Send it again."
+    if not file_id:
+        await q.message.reply_text(
+            "❌ Image session not found. Send the image again."
         )
         return
-
-    raw = await read_temp_file(
-        file_id
-    )
-
-    if not raw:
-        await update.callback_query.message.reply_text(
-            "Image expired. Send it again."
-        )
-        return
-
-    _, image_bytes = raw
-
-    width, height, _ = image_info(
-        image_bytes
-    )
-
-    ratio = context.user_data["ratio"]
-
-    if ratio in RATIOS:
-        target_w, target_h = _target_dimensions(
-            width,
-            height,
-            ratio,
-        )
-
-    else:
-        target_w, target_h = context.user_data[
-            "custom_size"
-        ]
-
-    side = context.user_data["side"]
 
     try:
+
+        record = await get_temp_file(
+            file_id
+        )
+
+        if not record:
+            await q.message.reply_text(
+                "❌ Image expired. Send it again."
+            )
+            return
+
+        raw = await read_temp_file(
+            file_id
+        )
+
+        if not raw:
+            await q.message.reply_text(
+                "❌ Image expired. Send it again."
+            )
+            return
+
+        _, image_bytes = raw
+
+        width, height, _ = image_info(
+            image_bytes
+        )
+
+        ratio = context.user_data.get(
+            "ratio"
+        )
+
+        if not ratio:
+            raise ValueError(
+                "Expand ratio is missing."
+            )
+
+        if ratio in RATIOS:
+
+            target_w, target_h = (
+                _target_dimensions(
+                    width,
+                    height,
+                    ratio,
+                )
+            )
+
+        else:
+
+            custom_size = context.user_data.get(
+                "custom_size"
+            )
+
+            if not custom_size:
+                raise ValueError(
+                    "Custom target size is missing."
+                )
+
+            target_w, target_h = custom_size
+
+        side = context.user_data.get(
+            "side"
+        )
+
+        if not side:
+            raise ValueError(
+                "Expand side is missing."
+            )
+
+        # ----------------------------------------------------
+        # Validate expansion before running API
+        # ----------------------------------------------------
+
         from app.services.expand import build_expansion
 
         build_expansion(
@@ -419,28 +783,49 @@ async def prepare_ratio_expand(
             side,
         )
 
+        context.user_data[
+            "target_size"
+        ] = (
+            target_w,
+            target_h,
+        )
+
+        await q.message.reply_text(
+            "Choose result scale.",
+            reply_markup=scales(
+                "expandscale"
+            ),
+        )
+
     except ValueError as exc:
-        await update.callback_query.message.reply_text(
+
+        await q.message.reply_text(
             f"❌ {exc}\n"
             "Choose another side or ratio."
         )
-        return
 
-    context.user_data["target_size"] = (
-        target_w,
-        target_h,
-    )
+    except Exception as exc:
 
-    await update.callback_query.message.reply_text(
-        "Choose result scale.",
-        reply_markup=scales("expandscale"),
-    )
+        logger.exception(
+            "Preparing ratio expansion failed"
+        )
 
+        await q.message.reply_text(
+            f"❌ {exc}"
+        )
+
+
+# ============================================================
+# TEXT HANDLER
+# ============================================================
 
 async def text(
     update,
     context,
 ):
+    if not update.message:
+        return False
+
     wait = context.user_data.get(
         "expand_wait"
     )
@@ -449,14 +834,24 @@ async def text(
         return False
 
     try:
+
+        # ----------------------------------------------------
+        # CUSTOM SIZE
+        # ----------------------------------------------------
+
         if wait == "custom":
-            context.user_data["custom_size"] = (
-                _parse_custom(
-                    update.message.text
-                )
+
+            custom_size = _parse_custom(
+                update.message.text
             )
 
-            context.user_data["ratio"] = "custom"
+            context.user_data[
+                "custom_size"
+            ] = custom_size
+
+            context.user_data[
+                "ratio"
+            ] = "custom"
 
             context.user_data.pop(
                 "expand_wait",
@@ -468,17 +863,36 @@ async def text(
                 reply_markup=sides(),
             )
 
-        elif wait == "amount":
-            amount = int(
-                update.message.text.strip()
+            return True
+
+        # ----------------------------------------------------
+        # EXPANSION AMOUNT
+        # ----------------------------------------------------
+
+        if wait == "amount":
+
+            raw_amount = (
+                update.message.text
+                .strip()
             )
+
+            try:
+                amount = int(
+                    raw_amount
+                )
+            except ValueError:
+                raise ValueError(
+                    "Expansion amount must be a number."
+                )
 
             if not 1 <= amount <= 2000:
-                raise ValueError
+                raise ValueError(
+                    "Expansion amount must be between 1 and 2000 pixels."
+                )
 
-            context.user_data["expand_amount"] = (
-                amount
-            )
+            context.user_data[
+                "expand_amount"
+            ] = amount
 
             context.user_data.pop(
                 "expand_wait",
@@ -487,16 +901,27 @@ async def text(
 
             await update.message.reply_text(
                 "Choose result scale.",
-                reply_markup=scales("expandscale"),
+                reply_markup=scales(
+                    "expandscale"
+                ),
             )
 
-    except Exception:
+            return True
+
+        return False
+
+    except Exception as exc:
+
         await update.message.reply_text(
-            "Invalid value."
+            f"❌ {exc}"
         )
 
-    return True
+        return True
 
+
+# ============================================================
+# RUN IMAGE OPERATION
+# ============================================================
 
 async def run_operation(
     update,
@@ -511,45 +936,82 @@ async def run_operation(
         "",
     )
 
-    record = await get_temp_file(
-        file_id
-    )
-
-    if not record:
+    if not file_id:
         await q.message.reply_text(
-            "Image expired. Send it again."
+            "❌ Image session not found. Send the image again."
         )
         return
 
     intermediate_id = None
 
     try:
-        # ---------------------------------------------
-        # Validate scale
-        # ---------------------------------------------
+
+        # ----------------------------------------------------
+        # VALIDATE OPERATION
+        # ----------------------------------------------------
+
+        valid_operations = {
+            "upscale",
+            "remove",
+            "expand",
+        }
+
+        if operation not in valid_operations:
+            raise ValueError(
+                "Unknown image operation."
+            )
+
+        # ----------------------------------------------------
+        # VALIDATE SCALE
+        # ----------------------------------------------------
 
         if scale not in (2, 4):
             raise ValueError(
                 "Scale must be 2 or 4."
             )
 
-        # ---------------------------------------------
-        # Validate public URL
-        # ---------------------------------------------
+        # ----------------------------------------------------
+        # CHECK TEMP FILE
+        # ----------------------------------------------------
 
-        if not settings.public_base_url:
+        record = await get_temp_file(
+            file_id
+        )
+
+        if not record:
+            raise RuntimeError(
+                "Image expired. Send it again."
+            )
+
+        # ----------------------------------------------------
+        # PUBLIC URL
+        # ----------------------------------------------------
+
+        public_base_url = (
+            settings.public_base_url
+            or ""
+        ).strip().rstrip("/")
+
+        if not public_base_url:
             raise RuntimeError(
                 "PUBLIC_BASE_URL is not configured."
             )
 
         image_url = (
-            f"{settings.public_base_url}"
+            f"{public_base_url}"
             f"/media/{file_id}"
         )
 
-        # =============================================
-        # UPSCALE
-        # =============================================
+        logger.info(
+            "Starting image operation=%s scale=%s file_id=%s",
+            operation,
+            scale,
+            file_id,
+        )
+
+        # ====================================================
+        # DIRECT UPSCALE
+        # ====================================================
 
         if operation == "upscale":
 
@@ -558,14 +1020,26 @@ async def run_operation(
                 "Please wait."
             )
 
+            logger.info(
+                "Calling upscale service: %s",
+                image_url,
+            )
+
             result, ctype = await upscale(
                 image_url,
                 scale,
             )
 
-        # =============================================
+            logger.info(
+                "Upscale completed: scale=%s bytes=%s type=%s",
+                scale,
+                len(result) if result else 0,
+                ctype,
+            )
+
+        # ====================================================
         # REMOVE BACKGROUND
-        # =============================================
+        # ====================================================
 
         elif operation == "remove":
 
@@ -573,13 +1047,20 @@ async def run_operation(
                 "⏳ Removing background..."
             )
 
-            result, ctype = await remove_background(
-                image_url
+            result, ctype = (
+                await remove_background(
+                    image_url
+                )
             )
 
-            # -----------------------------------------
-            # Remove BG -> Upscale
-            # -----------------------------------------
+            if not result:
+                raise RuntimeError(
+                    "Remove background returned an empty result."
+                )
+
+            # ------------------------------------------------
+            # REMOVE BG -> UPSCALE
+            # ------------------------------------------------
 
             if scale in (2, 4):
 
@@ -610,17 +1091,33 @@ async def run_operation(
                     + timedelta(minutes=10),
                 )
 
+                intermediate_url = (
+                    f"{public_base_url}"
+                    f"/media/{intermediate_id}"
+                )
+
+                logger.info(
+                    "Remove BG complete; starting upscale "
+                    "scale=%s url=%s",
+                    scale,
+                    intermediate_url,
+                )
+
                 result, ctype = await upscale(
-                    (
-                        f"{settings.public_base_url}"
-                        f"/media/{intermediate_id}"
-                    ),
+                    intermediate_url,
                     scale,
                 )
 
-        # =============================================
+                logger.info(
+                    "Remove BG upscale completed: "
+                    "bytes=%s type=%s",
+                    len(result) if result else 0,
+                    ctype,
+                )
+
+        # ====================================================
         # EXPAND
-        # =============================================
+        # ====================================================
 
         elif operation == "expand":
 
@@ -643,9 +1140,9 @@ async def run_operation(
                 original_bytes
             )
 
-            # -----------------------------------------
-            # Target size from ratio
-            # -----------------------------------------
+            # ------------------------------------------------
+            # TARGET SIZE
+            # ------------------------------------------------
 
             if "target_size" in context.user_data:
 
@@ -654,10 +1151,6 @@ async def run_operation(
                         "target_size"
                     ]
                 )
-
-            # -----------------------------------------
-            # Target size from amount
-            # -----------------------------------------
 
             elif "expand_amount" in context.user_data:
 
@@ -668,6 +1161,11 @@ async def run_operation(
                 side = context.user_data.get(
                     "side"
                 )
+
+                if not side:
+                    raise RuntimeError(
+                        "Expand side is missing."
+                    )
 
                 target_w = width
                 target_h = height
@@ -684,9 +1182,14 @@ async def run_operation(
                 ):
                     target_h += amount
 
-                else:
+                elif side == "all":
                     target_w += amount * 2
                     target_h += amount * 2
+
+                else:
+                    raise RuntimeError(
+                        "Invalid expand side."
+                    )
 
             else:
                 raise RuntimeError(
@@ -702,6 +1205,15 @@ async def run_operation(
                     "Expand side is missing."
                 )
 
+            logger.info(
+                "Expand: %sx%s -> %sx%s side=%s",
+                width,
+                height,
+                target_w,
+                target_h,
+                side,
+            )
+
             result, ctype = await expand(
                 image_url,
                 width,
@@ -711,9 +1223,14 @@ async def run_operation(
                 side,
             )
 
-            # -----------------------------------------
-            # Expand -> Upscale
-            # -----------------------------------------
+            if not result:
+                raise RuntimeError(
+                    "Expand returned an empty result."
+                )
+
+            # ------------------------------------------------
+            # EXPAND -> UPSCALE
+            # ------------------------------------------------
 
             if scale in (2, 4):
 
@@ -745,22 +1262,52 @@ async def run_operation(
                     + timedelta(minutes=10),
                 )
 
+                intermediate_url = (
+                    f"{public_base_url}"
+                    f"/media/{intermediate_id}"
+                )
+
+                logger.info(
+                    "Expand complete; starting upscale "
+                    "scale=%s url=%s",
+                    scale,
+                    intermediate_url,
+                )
+
                 result, ctype = await upscale(
-                    (
-                        f"{settings.public_base_url}"
-                        f"/media/{intermediate_id}"
-                    ),
+                    intermediate_url,
                     scale,
                 )
 
-        else:
-            raise ValueError(
-                "Unknown image operation."
+                logger.info(
+                    "Expand upscale completed: "
+                    "bytes=%s type=%s",
+                    len(result) if result else 0,
+                    ctype,
+                )
+
+        # ----------------------------------------------------
+        # CHECK RESULT
+        # ----------------------------------------------------
+
+        if not result:
+            raise RuntimeError(
+                "Image processing returned an empty result."
             )
 
-        # =============================================
-        # USER / BOT SETTINGS
-        # =============================================
+        if not isinstance(
+            result,
+            (bytes, bytearray),
+        ):
+            raise RuntimeError(
+                "Image processing returned invalid result data."
+            )
+
+        result = bytes(result)
+
+        # ====================================================
+        # SETTINGS
+        # ====================================================
 
         user = await get_user_settings(
             update.effective_user.id
@@ -768,91 +1315,197 @@ async def run_operation(
 
         bot = await get_bot_settings()
 
-        fmt = user["format"]
+        output_settings = (
+            bot.get("output") or {}
+        )
 
-        quality = min(
-            int(user["jpeg_quality"]),
-            int(
-                bot["output"].get(
+        fmt = user.get(
+            "format",
+            "jpg",
+        )
+
+        try:
+            user_quality = int(
+                user.get(
                     "jpeg_quality",
                     95,
                 )
+            )
+        except Exception:
+            user_quality = 95
+
+        try:
+            bot_quality = int(
+                output_settings.get(
+                    "jpeg_quality",
+                    95,
+                )
+            )
+        except Exception:
+            bot_quality = 95
+
+        quality = min(
+            user_quality,
+            bot_quality,
+        )
+
+        quality = max(
+            1,
+            min(
+                quality,
+                100,
             ),
         )
 
-        # =============================================
+        # ====================================================
         # CONVERT OUTPUT
-        # =============================================
+        # ====================================================
 
-        result, out_ctype, ext = convert_output(
-            result,
-            fmt,
-            quality,
+        result, out_ctype, ext = (
+            convert_output(
+                result,
+                fmt,
+                quality,
+            )
         )
 
-        # =============================================
+        if not result:
+            raise RuntimeError(
+                "Output conversion produced an empty result."
+            )
+
+        # ====================================================
         # FILENAME
-        # =============================================
+        # ====================================================
 
         filename = normalize_filename(
             context.user_data.get(
                 "name",
                 "image",
             ),
-            user["prefix"],
-            user["suffix"],
+            user.get(
+                "prefix",
+                "",
+            ),
+            user.get(
+                "suffix",
+                "",
+            ),
             scale,
             ext,
             bool(
-                user["scale_in_filename"]
+                user.get(
+                    "scale_in_filename",
+                    True,
+                )
             ),
         )
 
-        # =============================================
+        # ====================================================
         # THUMBNAIL
-        # =============================================
+        # ====================================================
 
         thumbnail_enabled = bool(
-            user["thumbnail"]
-            and bot["output"].get(
+            user.get(
+                "thumbnail",
+                True,
+            )
+            and output_settings.get(
                 "thumbnail",
                 True,
             )
         )
 
-        thumb_bytes = (
-            make_thumbnail(result)
-            if thumbnail_enabled
-            else None
+        thumb_bytes = None
+
+        if thumbnail_enabled:
+
+            try:
+                thumb_bytes = make_thumbnail(
+                    result
+                )
+            except Exception:
+                logger.exception(
+                    "Thumbnail creation failed; "
+                    "sending result without thumbnail"
+                )
+                thumb_bytes = None
+
+        # ====================================================
+        # SEND RESULT
+        # ====================================================
+
+        result_size_mb = (
+            len(result)
+            / (
+                1024 * 1024
+            )
         )
 
-        # =============================================
-        # SEND RESULT
-        # =============================================
+        logger.info(
+            "Sending Telegram result: "
+            "operation=%s scale=%s size=%.2f MB "
+            "filename=%s type=%s",
+            operation,
+            scale,
+            result_size_mb,
+            filename,
+            out_ctype,
+        )
 
-        await q.message.reply_document(
-            document=BytesIO(result),
-            filename=filename,
-            thumbnail=(
-                InputFile(
-                    BytesIO(thumb_bytes),
-                    filename="thumb.jpg",
-                )
-                if thumb_bytes
-                else None
-            ),
-            caption=(
-                "✅ "
-                f"{operation.replace('_', ' ').title()} "
-                f"{scale}× complete."
-            ),
+        try:
+
+            await q.message.reply_document(
+                document=BytesIO(result),
+                filename=filename,
+                thumbnail=(
+                    InputFile(
+                        BytesIO(thumb_bytes),
+                        filename="thumb.jpg",
+                    )
+                    if thumb_bytes
+                    else None
+                ),
+                caption=(
+                    "✅ "
+                    f"{operation.replace('_', ' ').title()} "
+                    f"{scale}× complete."
+                ),
+            )
+
+        except TelegramError as send_exc:
+
+            logger.exception(
+                "Telegram failed to send processed result"
+            )
+
+            # Give user the actual Telegram error instead
+            # of hiding it behind "Processing failed."
+            raise RuntimeError(
+                f"Telegram could not send the result: "
+                f"{send_exc}"
+            ) from send_exc
+
+        logger.info(
+            "Image operation completed successfully: "
+            "operation=%s scale=%s",
+            operation,
+            scale,
         )
 
     except Exception as exc:
 
-        # ---------------------------------------------
-        # Get useful error message
-        # ---------------------------------------------
+        logger.exception(
+            "Image operation failed: "
+            "operation=%s scale=%s file_id=%s",
+            operation,
+            scale,
+            file_id,
+        )
+
+        # ----------------------------------------------------
+        # USER-FRIENDLY ERROR
+        # ----------------------------------------------------
 
         if isinstance(
             exc,
@@ -860,46 +1513,67 @@ async def run_operation(
         ):
             message = str(exc)
 
+        elif isinstance(
+            exc,
+            TelegramError,
+        ):
+            message = (
+                f"Telegram error: {exc}"
+            )
+
         else:
             message = (
-                "Processing failed."
+                f"{type(exc).__name__}: {exc}"
+            )
+
+        if not message:
+            message = (
+                "Unknown processing error."
             )
 
         try:
             await q.message.reply_text(
                 f"❌ {message}"
             )
-
         except Exception:
-            pass
+            logger.exception(
+                "Failed to send operation error"
+            )
 
     finally:
 
-        # ---------------------------------------------
-        # Delete original temporary file
-        # ---------------------------------------------
+        # ----------------------------------------------------
+        # DELETE ORIGINAL TEMP FILE
+        # ----------------------------------------------------
 
         try:
             await delete_temp_file(
                 file_id
             )
         except Exception:
-            pass
+            logger.exception(
+                "Failed to delete original temp file: %s",
+                file_id,
+            )
 
-        # ---------------------------------------------
-        # Delete intermediate file
-        # ---------------------------------------------
+        # ----------------------------------------------------
+        # DELETE INTERMEDIATE TEMP FILE
+        # ----------------------------------------------------
 
         if intermediate_id:
+
             try:
                 await delete_temp_file(
                     intermediate_id
                 )
             except Exception:
-                pass
+                logger.exception(
+                    "Failed to delete intermediate temp file: %s",
+                    intermediate_id,
+                )
 
-        # ---------------------------------------------
-        # Clear user state
-        # ---------------------------------------------
+        # ----------------------------------------------------
+        # CLEAR USER STATE
+        # ----------------------------------------------------
 
         context.user_data.clear()
