@@ -11,7 +11,7 @@ services:
     healthCheckPath: /api/healthz
 
     envVars:
-      # Required
+      # Required secrets
       - key: TELEGRAM_BOT_TOKEN
         sync: false
 
@@ -22,13 +22,13 @@ services:
         sync: false
 
       - key: SETTINGS_ENCRYPTION_KEY
-        sync: false
+        generateValue: true
 
       - key: PUBLIC_BASE_URL
         sync: false
 
       - key: WEBHOOK_SECRET
-        sync: false
+        generateValue: true
 
       # Optional / default configuration
       - key: MONGODB_DATABASE
