@@ -37,20 +37,35 @@ def build_application():
         .build()
     )
 
-    # Commands
+    # =========================
+    # COMMAND HANDLERS
+    # =========================
+
     app.add_handler(
-        CommandHandler("start", start)
+        CommandHandler(
+            "start",
+            start,
+        )
     )
 
     app.add_handler(
-        CommandHandler("us", user_settings)
+        CommandHandler(
+            "us",
+            user_settings,
+        )
     )
 
     app.add_handler(
-        CommandHandler("bs", admin_settings)
+        CommandHandler(
+            "bs",
+            admin_settings,
+        )
     )
 
-    # User settings callbacks
+    # =========================
+    # USER SETTINGS CALLBACKS
+    # =========================
+
     app.add_handler(
         CallbackQueryHandler(
             user_settings_callback,
@@ -58,7 +73,10 @@ def build_application():
         )
     )
 
-    # Admin callbacks
+    # =========================
+    # ADMIN CALLBACKS
+    # =========================
+
     app.add_handler(
         CallbackQueryHandler(
             admin_callback,
@@ -66,10 +84,10 @@ def build_application():
         )
     )
 
-    # Image operation callbacks
-    #
-    # block=False is useful because upscale/remove-bg/expand
-    # can take some time to finish.
+    # =========================
+    # IMAGE CALLBACKS
+    # =========================
+
     app.add_handler(
         CallbackQueryHandler(
             image_callback,
@@ -78,39 +96,47 @@ def build_application():
         )
     )
 
-    # Text handlers
-    # Priority order is important.
+    # =========================
+    # TEXT HANDLERS
+    # =========================
+
+    # Priority 0
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
             image_text,
-            group=0,
-        )
+        ),
+        group=0,
     )
 
+    # Priority 1
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
             user_settings_text,
-            group=1,
-        )
+        ),
+        group=1,
     )
 
+    # Priority 2
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
             admin_text,
-            group=2,
-        )
+        ),
+        group=2,
     )
 
-    # Image receiver
+    # =========================
+    # IMAGE RECEIVER
+    # =========================
+
     app.add_handler(
         MessageHandler(
             filters.PHOTO | filters.Document.IMAGE,
             receive,
-            group=3,
-        )
+        ),
+        group=3,
     )
 
     return app
